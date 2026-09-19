@@ -15,6 +15,7 @@ Previously we relied on the excellent `rfc3986` package to handle URL parsing an
 validation, but this module provides a simpler alternative, with less indirection
 required.
 """
+
 import ipaddress
 import re
 import typing
@@ -31,7 +32,36 @@ UNRESERVED_CHARACTERS = (
 )
 SUB_DELIMS = "!$&'()*+,;="
 
+# Percent-encoded sequences are validated *before* component-wise encoding,
+# so a malformed sequence ("%zz", "%4") is rejected rather than having its
+# leading "%" percent-encoded a second time.
 PERCENT_ENCODED_REGEX = re.compile("%[A-Fa-f0-9]{2}")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# Characters that are allowed to remain unencoded in each component, in
+# addition to the unreserved character set. These sets deliberately differ
+# per component so that delimiter characters are only treated as safe where
+# they do not terminate the component:
+#
+# * userinfo: the sub-delimiters and ":". "@" must be encoded since it
+#   marks the end of the userinfo.
+# * path: the sub-delimiters plus the path-related gen-delimiters.
+# * query: the sub-delimiters plus ":", "?", "[", "]" and "@". "/" is *not*
+#   included here (it is encoded as "%2F"), so the query does not share the
+#   path's safe set.
+# * fragment: the sub-delimiters plus "/", "?", ":", "[", "]" and "@".
+#   "#" may remain as-is, as the fragment is the final component.
+USERINFO_SAFE_CHARACTERS = SUB_DELIMS + ":"
+PATH_SAFE_CHARACTERS = SUB_DELIMS + ":/[]@"
+QUERY_SAFE_CHARACTERS = SUB_DELIMS + ":?[]@"
+FRAGMENT_SAFE_CHARACTERS = SUB_DELIMS + ":/?#[]@"
+HOST_SAFE_CHARACTERS = SUB_DELIMS
+
+# When a username or password is supplied as a *decoded* value it is
+# pre-encoded before the ":" separator is inserted. The separator itself is
+# therefore excluded from the safe set, along with "@", so a ":" inside a
+# username (eg. "a:b") cannot later be mistaken for the user/password split.
+USERINFO_SUBCOMPONENT_SAFE_CHARACTERS = SUB_DELIMS
 
 
 # {scheme}:      (optional)
@@ -173,9 +203,22 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
         kwargs["host"], _, kwargs["port"] = netloc.partition(":")
 
     # Replace "username" and/or "password" with "userinfo".
+    #
+    # These values are *decoded* input (eg. the "@" in "user@example.com"
+    # represents an actual "@" character), so a literal "%" is encoded as
+    # "%25". The ":" and "@" delimiters are encoded too, so the assembled
+    # userinfo cannot be mis-split when it is reparsed. When a fully-formed
+    # userinfo is supplied instead, it is treated as already-serialized input
+    # below, with existing escapes validated.
     if "username" in kwargs or "password" in kwargs:
-        username = quote(kwargs.pop("username", "") or "")
-        password = quote(kwargs.pop("password", "") or "")
+        username = quote(
+            kwargs.pop("username", "") or "",
+            safe=USERINFO_SUBCOMPONENT_SAFE_CHARACTERS,
+        )
+        password = quote(
+            kwargs.pop("password", "") or "",
+            safe=USERINFO_SUBCOMPONENT_SAFE_CHARACTERS,
+        )
         kwargs["userinfo"] = f"{username}:{password}" if password else username
 
     # Replace "raw_path" with "path" and "query".
@@ -241,7 +284,9 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
     # We end up with a parsed representation of the URL,
     # with components that are plain ASCII bytestrings.
     parsed_scheme: str = scheme.lower()
-    parsed_userinfo: str = quote(userinfo, safe=SUB_DELIMS + ":")
+    # Existing percent-encoded sequences are validated and preserved, while
+    # other characters are encoded against the safe set for this component.
+    parsed_userinfo: str = requote(userinfo, safe=USERINFO_SAFE_CHARACTERS)
     parsed_host: str = encode_host(host)
     parsed_port: typing.Optional[int] = normalize_port(port, scheme)
 
@@ -257,17 +302,21 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
     # These do not need to be percent-quoted unless they serve as delimiters for the
     # specific component.
 
+    # Each component is encoded against its own safe character set, so that an
+    # already-escaped sequence is never re-encoded and a raw reserved character
+    # cannot leak past a component boundary.
+
     # For 'path' we need to drop ? and # from the GEN_DELIMS set.
-    parsed_path: str = quote(path, safe=SUB_DELIMS + ":/[]@")
+    parsed_path: str = requote(path, safe=PATH_SAFE_CHARACTERS)
     # For 'query' we need to drop '#' from the GEN_DELIMS set.
     # We also exclude '/' because it is more robust to replace it with a percent
     # encoding despite it not being a requirement of the spec.
     parsed_query: typing.Optional[str] = (
-        None if query is None else quote(query, safe=SUB_DELIMS + ":?[]@")
+        None if query is None else requote(query, safe=QUERY_SAFE_CHARACTERS)
     )
     # For 'fragment' we can include all of the GEN_DELIMS set.
     parsed_fragment: typing.Optional[str] = (
-        None if fragment is None else quote(fragment, safe=SUB_DELIMS + ":/?#[]@")
+        None if fragment is None else requote(fragment, safe=FRAGMENT_SAFE_CHARACTERS)
     )
 
     # The parsed ASCII bytestrings are our canonical form.
@@ -320,7 +369,7 @@ def encode_host(host: str) -> str:
         # From https://datatracker.ietf.org/doc/html/rfc3986/#section-3.2.2
         #
         # reg-name    = *( unreserved / pct-encoded / sub-delims )
-        return quote(host.lower(), safe=SUB_DELIMS)
+        return requote(host.lower(), safe=HOST_SAFE_CHARACTERS)
 
     # IDNA hostnames
     try:
@@ -438,7 +487,14 @@ def is_safe(string: str, safe: str = "/") -> bool:
 
 def quote(string: str, safe: str = "/") -> str:
     """
-    Use percent-encoding to quote a string if required.
+    Use percent-encoding to quote a *decoded* value, such as a query
+    parameter name/value or a username/password supplied to ``copy_with``.
+
+    If the value already consists solely of safe characters and valid
+    percent-encoded sequences it is returned untouched, so values like
+    "with%20spaces" are not encoded a second time. Otherwise the *whole*
+    value is encoded, including any "%" characters (as "%25"), since the
+    value is treated as plain text rather than a serialized component.
     """
     if is_safe(string, safe=safe):
         return string
@@ -447,6 +503,50 @@ def quote(string: str, safe: str = "/") -> str:
     return "".join(
         [char if char in NON_ESCAPED_CHARS else percent_encode(char) for char in string]
     )
+
+
+def requote(string: str, safe: str = "/") -> str:
+    """
+    Normalize a component that is already serialized (possibly containing
+    percent-encoded sequences) into its canonical ASCII form.
+
+    Processing follows the WHATWG "percent-encode after parsing" model:
+
+    1.  Existing percent-encoded sequences are validated first. A "%" that
+        is not followed by two ASCII hex digits is invalid and raises
+        ``InvalidURL`` for every component, so malformed input can never be
+        silently re-encoded (eg. "%zz" -> "%25zz").
+    2.  Valid "%xx" sequences are passed through untouched. The parse step
+        guarantees every component contains only ASCII, so this is also
+        idempotent: requoting a parsed component leaves it unchanged.
+    3.  Unreserved characters and the component-specific `safe` characters
+        are left alone; every other character is UTF-8 percent-encoded.
+    """
+    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe
+    output: typing.List[str] = []
+    length = len(string)
+    index = 0
+    while index < length:
+        char = string[index]
+        if char == "%":
+            # A percent must be followed by two ASCII hex digits, otherwise
+            # it cannot be an escape sequence and a raw "%" is not allowed
+            # in any component.
+            if (
+                index + 2 >= length
+                or string[index + 1] not in _HEX_DIGITS
+                or string[index + 2] not in _HEX_DIGITS
+            ):
+                raise InvalidURL("Invalid percent-escape sequence in URL")
+            output.append(string[index : index + 3])
+            index += 3
+        elif char in NON_ESCAPED_CHARS:
+            output.append(char)
+            index += 1
+        else:
+            output.append(percent_encode(char))
+            index += 1
+    return "".join(output)
 
 
 def urlencode(items: typing.List[typing.Tuple[str, str]]) -> str:
