@@ -16,6 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 * Allow URLs where username or password contains unescaped '@'. (#2986)
 * Ensure ASGI `raw_path` does not include URL query component. (#2999)
 * Ensure `Response.iter_text()` cannot yield empty strings. (#2998)
+* Unify percent-encoding across URL components: existing percent-escape
+  sequences are validated and preserved instead of being re-encoded, while
+  raw reserved characters are encoded using each component's own safe set.
+  Invalid percent-escape sequences now raise `InvalidURL`, and `copy_with()`
+  and `join()` remain idempotent for already-escaped URLs.
 
 ## 0.25.2 (24th November, 2023)
 

@@ -33,6 +33,28 @@ SUB_DELIMS = "!$&'()*+,;="
 
 PERCENT_ENCODED_REGEX = re.compile("%[A-Fa-f0-9]{2}")
 
+# https://datatracker.ietf.org/doc/html/rfc3986.html#section-2.2
+# The GEN_DELIMS set is ": / ? # [ ] @".
+# These characters only need to be percent-quoted when they do not serve
+# as delimiters within the component they occur in.
+#
+# The 'safe' characters for each component are therefore the sub-delims,
+# plus whichever gen-delims have no delimiting role in that component.
+# https://url.spec.whatwg.org/#percent-encoded-bytes
+
+# In 'userinfo' the ':' separator between username and password is allowed.
+USERINFO_SAFE_CHARACTERS = SUB_DELIMS + ":"
+# In 'host' none of the gen-delims are allowed.
+HOST_SAFE_CHARACTERS = SUB_DELIMS
+# In 'path' the '?' and '#' delimiters are excluded.
+PATH_SAFE_CHARACTERS = SUB_DELIMS + ":/[]@"
+# In 'query' the '#' delimiter is excluded. We also exclude '/', because it
+# is more robust to percent-encode it despite it being allowed by the spec,
+# and it must not reuse the safe set of the path component.
+QUERY_SAFE_CHARACTERS = SUB_DELIMS + ":?[]@"
+# In 'fragment' all of the gen-delims may occur literally.
+FRAGMENT_SAFE_CHARACTERS = SUB_DELIMS + ":/?#[]@"
+
 
 # {scheme}:      (optional)
 # //{authority}  (optional)
@@ -173,9 +195,11 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
         kwargs["host"], _, kwargs["port"] = netloc.partition(":")
 
     # Replace "username" and/or "password" with "userinfo".
+    # These are raw (decoded) strings rather than URL components, so any
+    # reserved characters and bare '%' characters are percent-encoded.
     if "username" in kwargs or "password" in kwargs:
-        username = quote(kwargs.pop("username", "") or "")
-        password = quote(kwargs.pop("password", "") or "")
+        username = encode(kwargs.pop("username", "") or "")
+        password = encode(kwargs.pop("password", "") or "")
         kwargs["userinfo"] = f"{username}:{password}" if password else username
 
     # Replace "raw_path" with "path" and "query".
@@ -241,7 +265,7 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
     # We end up with a parsed representation of the URL,
     # with components that are plain ASCII bytestrings.
     parsed_scheme: str = scheme.lower()
-    parsed_userinfo: str = quote(userinfo, safe=SUB_DELIMS + ":")
+    parsed_userinfo: str = quote(userinfo, safe=USERINFO_SAFE_CHARACTERS)
     parsed_host: str = encode_host(host)
     parsed_port: typing.Optional[int] = normalize_port(port, scheme)
 
@@ -253,21 +277,16 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
     if has_authority:
         path = normalize_path(path)
 
-    # The GEN_DELIMS set is... : / ? # [ ] @
-    # These do not need to be percent-quoted unless they serve as delimiters for the
-    # specific component.
-
-    # For 'path' we need to drop ? and # from the GEN_DELIMS set.
-    parsed_path: str = quote(path, safe=SUB_DELIMS + ":/[]@")
-    # For 'query' we need to drop '#' from the GEN_DELIMS set.
-    # We also exclude '/' because it is more robust to replace it with a percent
-    # encoding despite it not being a requirement of the spec.
+    # Percent-encoding rules are component specific:
+    # existing percent-escape sequences are validated first, and only
+    # characters outside the component's safe set are percent-encoded.
+    # This keeps re-parsing (including via `copy_with`/`join`) idempotent.
+    parsed_path: str = quote(path, safe=PATH_SAFE_CHARACTERS)
     parsed_query: typing.Optional[str] = (
-        None if query is None else quote(query, safe=SUB_DELIMS + ":?[]@")
+        None if query is None else quote(query, safe=QUERY_SAFE_CHARACTERS)
     )
-    # For 'fragment' we can include all of the GEN_DELIMS set.
     parsed_fragment: typing.Optional[str] = (
-        None if fragment is None else quote(fragment, safe=SUB_DELIMS + ":/?#[]@")
+        None if fragment is None else quote(fragment, safe=FRAGMENT_SAFE_CHARACTERS)
     )
 
     # The parsed ASCII bytestrings are our canonical form.
@@ -320,7 +339,7 @@ def encode_host(host: str) -> str:
         # From https://datatracker.ietf.org/doc/html/rfc3986/#section-3.2.2
         #
         # reg-name    = *( unreserved / pct-encoded / sub-delims )
-        return quote(host.lower(), safe=SUB_DELIMS)
+        return quote(host.lower(), safe=HOST_SAFE_CHARACTERS)
 
     # IDNA hostnames
     try:
@@ -421,6 +440,28 @@ def percent_encode(char: str) -> str:
     return "".join([f"%{byte:02x}" for byte in char.encode("utf-8")]).upper()
 
 
+def encode(string: str, safe: str = "/") -> str:
+    """
+    Percent-encode a raw (decoded) string.
+
+    Every character outside the unreserved characters and the given `safe`
+    set is percent-encoded. A bare '%' character is always encoded as
+    '%25', since the input is treated as plain text rather than as a URL
+    component that may already contain percent-escape sequences.
+
+    For example:
+
+        encode("a b%c", safe="") == "a%20b%25c"
+    """
+    non_escaped_characters = UNRESERVED_CHARACTERS + safe
+    return "".join(
+        [
+            char if char in non_escaped_characters else percent_encode(char)
+            for char in string
+        ]
+    )
+
+
 def is_safe(string: str, safe: str = "/") -> bool:
     """
     Determine if a given string is already quote-safe.
@@ -438,15 +479,47 @@ def is_safe(string: str, safe: str = "/") -> bool:
 
 def quote(string: str, safe: str = "/") -> str:
     """
-    Use percent-encoding to quote a string if required.
-    """
-    if is_safe(string, safe=safe):
-        return string
+    Percent-encode a URL component, using a WHATWG style two-step process:
 
-    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe
-    return "".join(
-        [char if char in NON_ESCAPED_CHARS else percent_encode(char) for char in string]
-    )
+    1.  Any existing percent-escape sequences ('%xx') are validated and
+        passed through completely untouched. A bare '%' that is not followed
+        by two hex digits is invalid and raises `InvalidURL`.
+    2.  Any remaining character outside the unreserved characters and the
+        component specific `safe` set is percent-encoded using UTF-8.
+
+    Because valid escapes are left as-is, quoting is idempotent: parsing a
+    URL (including through `copy_with` or `join`) never re-encodes legal
+    escapes and never leaves raw reserved characters unencoded.
+    """
+    non_escaped_characters = UNRESERVED_CHARACTERS + safe
+    output: typing.List[str] = []
+    start = 0
+
+    for match in PERCENT_ENCODED_REGEX.finditer(string):
+        # Encode the literal text preceding this percent-escape sequence.
+        for char in string[start : match.start()]:
+            if char == "%":
+                raise InvalidURL(
+                    "Invalid percent-escape sequence in URL component"
+                )
+            if char in non_escaped_characters:
+                output.append(char)
+            else:
+                output.append(percent_encode(char))
+        # Preserve the existing escape sequence verbatim.
+        output.append(match.group())
+        start = match.end()
+
+    # Encode any literal text following the final percent-escape sequence.
+    for char in string[start:]:
+        if char == "%":
+            raise InvalidURL("Invalid percent-escape sequence in URL component")
+        if char in non_escaped_characters:
+            output.append(char)
+        else:
+            output.append(percent_encode(char))
+
+    return "".join(output)
 
 
 def urlencode(items: typing.List[typing.Tuple[str, str]]) -> str:
@@ -459,9 +532,20 @@ def urlencode(items: typing.List[typing.Tuple[str, str]]) -> str:
     Note that we use '%20' encoding for spaces. and '%2F  for '/'.
     This is slightly different than `requests`, but is the behaviour that browsers use.
 
+    A value that is already composed entirely of safe characters and valid
+    percent escapes is left as-is, while a value containing raw reserved
+    characters is fully percent-encoded, preserving the long-standing
+    string representation used by `QueryParams`.
+
     See
     - https://github.com/encode/httpx/issues/2536
     - https://github.com/encode/httpx/issues/2721
     - https://docs.python.org/3/library/urllib.parse.html#urllib.parse.urlencode
     """
-    return "&".join([quote(k, safe="") + "=" + quote(v, safe="") for k, v in items])
+
+    def encode_param(value: str) -> str:
+        if is_safe(value, safe=""):
+            return value
+        return encode(value, safe="")
+
+    return "&".join([encode_param(k) + "=" + encode_param(v) for k, v in items])

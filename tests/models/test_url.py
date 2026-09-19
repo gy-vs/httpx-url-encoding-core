@@ -120,6 +120,163 @@ def test_url_with_url_encoded_path():
     assert url.raw_path == b"/path%20to%20somewhere"
 
 
+# WHATWG style table-driven tests for the component-specific percent-encoding
+# rules. Each component:
+# * validates existing percent-escape sequences and preserves them,
+# * percent-encodes raw characters that are not safe within the component,
+# * leaves component-appropriate delimiters untouched.
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        # Raw characters in the path are encoded, but existing escapes
+        # and the path delimiters are preserved.
+        ("https://example.com/a%20b c", "https://example.com/a%20b%20c"),
+        ("https://example.com/a%2fb/c", "https://example.com/a%2fb/c"),
+        ("https://example.com/!$&'()*+,;=:/[]@",
+         "https://example.com/!$&'()*+,;=:/[]@"),
+        ("https://example.com/?#", "https://example.com/?#"),
+        ("https://example.com/#", "https://example.com/#"),
+        # Non-ASCII characters in the path are UTF-8 percent-encoded.
+        ("https://example.com/ /🌟/",
+         "https://example.com/%20/%F0%9F%8C%9F/"),
+        # The query uses its own safe set: '?' stays literal, but unlike the
+        # path, '/' is always percent-encoded.
+        ("https://example.com/?a%20b c", "https://example.com/?a%20b%20c"),
+        ("https://example.com/?a=b/c", "https://example.com/?a=b%2Fc"),
+        ("https://example.com/?a=b?c", "https://example.com/?a=b?c"),
+        ("https://example.com/?!$&'()*+,;= :?[]@",
+         "https://example.com/?!$&'()*+,;=%20:?[]@"),
+        ("https://example.com/?é", "https://example.com/?%C3%A9"),
+        # The fragment keeps all the generic delimiters, including '/' and '#'.
+        ("https://example.com/#frag%20ment x",
+         "https://example.com/#frag%20ment%20x"),
+        ("https://example.com/#!$&'()*+,;= :/?#[]@",
+         "https://example.com/#!$&'()*+,;=%20:/?#[]@"),
+        ("https://example.com/#🌟", "https://example.com/#%F0%9F%8C%9F"),
+        # The userinfo keeps only the sub-delims and the ':' password
+        # separator, but preserves valid escapes.
+        ("https://us%40er:pa%20ss@example.com/",
+         "https://us%40er:pa%20ss@example.com/"),
+        ("https://us er:p@ss@example.com/",
+         "https://us%20er:p%40ss@example.com/"),
+        ("https://!$&'()*+,;=:@example.com/",
+         "https://!$&'()*+,;=:@example.com/"),
+        ("https://usér@example.com/", "https://us%C3%A9r@example.com/"),
+        # An ASCII reg-name preserves valid escapes and sub-delims.
+        ("https://ex%2dample.com/", "https://ex%2dample.com/"),
+        ("https://exämple.com/", "https://xn--exmple-cua.com/"),
+        # Empty components. Note that `str()` preserves an empty path,
+        # while the `path`/`raw_path` properties default it to '/'.
+        ("https://example.com", "https://example.com"),
+        ("https://example.com?", "https://example.com?"),
+        ("https://example.com#", "https://example.com#"),
+        ("https://example.com?#", "https://example.com?#"),
+    ],
+)
+def test_component_percent_encoding(given, expected):
+    url = httpx.URL(given)
+    assert str(url) == expected
+    # Encoding is idempotent: parsing the canonical form is a no-op.
+    assert str(httpx.URL(str(url))) == str(url)
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        # A bare '%' or a '%' not followed by two hex digits is never valid,
+        # in any component.
+        "https://example.com/%",
+        "https://example.com/a%4",
+        "https://example.com/a%zz",
+        "https://example.com/%20%zz",
+        "https://example.com/?a%zz",
+        "https://example.com/?%",
+        "https://example.com/#frag%gg",
+        "https://user%0@example.com/",
+    ],
+)
+def test_invalid_percent_escape(given):
+    with pytest.raises(httpx.InvalidURL, match="Invalid percent-escape"):
+        httpx.URL(given)
+
+
+@pytest.mark.parametrize(
+    "component,value",
+    [
+        ("path", "/a%zz"),
+        ("query", b"a%zz"),
+        ("fragment", "a%zz"),
+        ("raw_path", b"/a%zz"),
+        ("userinfo", b"a%zz"),
+    ],
+)
+def test_invalid_percent_escape_in_component(component, value):
+    with pytest.raises(httpx.InvalidURL, match="Invalid percent-escape"):
+        httpx.URL("https://example.com/", **{component: value})
+
+
+def test_copy_with_encoding_is_idempotent():
+    # Legal escapes survive copy_with, while raw characters get encoded once.
+    url = httpx.URL("https://example.com/a%20b?c%20d#e%20f")
+    assert str(url.copy_with()) == str(url)
+    assert str(url.copy_with(path="/a%20b g")) == (
+        "https://example.com/a%20b%20g?c%20d#e%20f"
+    )
+    assert str(url.copy_with(query=b"c%20d g")) == (
+        "https://example.com/a%20b?c%20d%20g#e%20f"
+    )
+    assert str(url.copy_with(fragment="e%20f g")) == (
+        "https://example.com/a%20b?c%20d#e%20f%20g"
+    )
+    assert str(url.copy_with(raw_path=b"/a%20b?c%20d")) == str(url)
+
+    # Repeated copies converge on a single canonical form.
+    twice = url.copy_with().copy_with().copy_with()
+    assert str(twice) == str(url)
+
+    # Raw username/password text is fully encoded just once.
+    new = url.copy_with(username="us@er name", password="pa%20ss")
+    assert str(new) == (
+        "https://us%40er%20name:pa%2520ss@example.com/a%20b?c%20d#e%20f"
+    )
+    assert new.username == "us@er name"
+    assert new.password == "pa%20ss"
+    assert str(new.copy_with()) == str(new)
+
+
+def test_join_encoding_is_idempotent():
+    base = httpx.URL("https://example.com/a/b%20c")
+    # Escaped and raw characters in a relative reference are normalised
+    # consistently with parsing the URL directly.
+    joined = base.join("../x%20y z")
+    assert str(joined) == "https://example.com/x%20y%20z"
+    assert str(httpx.URL(str(joined))) == str(joined)
+    assert joined == "https://example.com/x%20y z"
+
+    # A joined absolute URL with mixed content round-trips too.
+    other = base.join("https://müller.de/p%2f?a=b/c#f%20g")
+    assert str(other) == "https://xn--mller-kva.de/p%2f?a=b%2Fc#f%20g"
+    assert str(httpx.URL(str(other))) == str(other)
+
+
+def test_raw_path_query_and_string_conventions():
+    # `raw_path` and `query` remain raw byte interfaces, and the path is
+    # exposed URL-decoded.
+    url = httpx.URL("https://example.com/a%20b?c%20d&e=f/g#g%20h")
+    assert url.path == "/a b"
+    assert url.query == b"c%20d&e=f%2Fg"
+    assert url.raw_path == b"/a%20b?c%20d&e=f%2Fg"
+    assert url.fragment == "g h"
+    assert str(url) == "https://example.com/a%20b?c%20d&e=f%2Fg#g%20h"
+
+    # Empty versus absent query/fragment remain distinguishable.
+    assert httpx.URL("https://example.com").raw_path == b"/"
+    assert httpx.URL("https://example.com?").raw_path == b"/?"
+    assert httpx.URL("https://example.com").query == b""
+
+
 def test_url_params():
     url = httpx.URL("https://example.org:123/path/to/somewhere", params={"a": "123"})
     assert str(url) == "https://example.org:123/path/to/somewhere?a=123"
